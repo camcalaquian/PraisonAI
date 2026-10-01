@@ -8,6 +8,7 @@ Provides both legacy API (classify_error) and new structured classification
 (classify_llm_error) with explicit recovery routing hints.
 """
 
+import math
 import re
 import random
 from dataclasses import dataclass
@@ -617,6 +618,21 @@ def _retry_after_http_date_delay(value: str) -> Optional[float]:
     return delay if delay > 0 else None
 
 
+def _usable_retry_delay(value: float, cap_seconds: float) -> Optional[float]:
+    """Return a capped, finite, non-negative delay or ``None`` if unusable.
+
+    A provider may send a malformed numeric Retry-After hint (``nan``, ``inf``
+    or a negative value). These are not valid non-negative retry delays — a
+    ``nan`` would poison the backoff and scheduler hold, a negative value would
+    yield an instant/past delay — so they are rejected here and the caller falls
+    through to its other signals. Finite non-negative values (including zero and
+    fractional seconds) are preserved and capped.
+    """
+    if not math.isfinite(value) or value < 0:
+        return None
+    return min(value, cap_seconds)
+
+
 def extract_retry_after(
     error: Exception, cap_seconds: float = 300.0,
 ) -> Optional[float]:
@@ -644,7 +660,7 @@ def extract_retry_after(
             retry_after = None
         if retry_after is not None:
             try:
-                return min(float(retry_after), cap_seconds)
+                parsed = float(retry_after)
             except (ValueError, TypeError):
                 # Not a plain delta-seconds value — RFC 7231 also permits an
                 # HTTP-date. Parse it so a provider that sends an absolute reset
@@ -654,11 +670,22 @@ def extract_retry_after(
                 delay = _retry_after_http_date_delay(str(retry_after))
                 if delay is not None:
                     return min(delay, cap_seconds)
+            else:
+                # A finite non-negative delta-seconds value is usable; a
+                # nan/inf/negative hint is ignored so it does not poison the
+                # backoff and we fall through to the other signals.
+                usable = _usable_retry_delay(parsed, cap_seconds)
+                if usable is not None:
+                    return usable
 
-    # 2. Some SDKs expose a numeric ``retry_after`` attribute directly.
+    # 2. Some SDKs expose a numeric ``retry_after`` attribute directly. A
+    #    nan/inf/negative attribute is ignored (not a usable delay) so it does
+    #    not poison the backoff and we fall through to the message fallback.
     retry_after_attr = getattr(error, "retry_after", None)
-    if isinstance(retry_after_attr, (int, float)):
-        return min(float(retry_after_attr), cap_seconds)
+    if isinstance(retry_after_attr, (int, float)) and not isinstance(retry_after_attr, bool):
+        usable = _usable_retry_delay(float(retry_after_attr), cap_seconds)
+        if usable is not None:
+            return usable
 
     error_str = str(error)
     
