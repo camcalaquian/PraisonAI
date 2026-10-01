@@ -1629,9 +1629,30 @@ class AgentFlow:
                     if verbose:
                         print(f"↩︎  cache hit: {step.name}")
                     previous_output = _cached.get("output")
-                    results.append({"step": step.name, "output": previous_output})
+                    # Replay the full step delta recorded on the cold run so a
+                    # hit is indistinguishable from re-executing: the step's
+                    # status/retries, any handler-supplied variables (and the
+                    # generated output variable, present only when the cold run
+                    # did not stop first), and -- crucially -- the stop signal.
+                    # A hit that only appended {step, output} and continued lost
+                    # the stop flag and the handler's variables, so a workflow
+                    # that stopped on the cold run ran on through the cached one.
+                    step_record = {
+                        "step": step.name,
+                        "output": previous_output,
+                        "status": _cached.get("status", "completed"),
+                        "retries": _cached.get("retries", 0),
+                    }
+                    results.append(step_record)
+                    self.step_statuses[step.name] = step_record["status"]
+                    if hasattr(step, 'status'):
+                        step.status = step_record["status"]
                     if _cached.get("variables"):
                         all_variables.update(_cached["variables"])
+                    if _cached.get("stop_workflow"):
+                        if verbose:
+                            print(f"🛑 Workflow stopped at: {step.name}")
+                        break
                     i += 1
                     continue
             
@@ -1668,6 +1689,7 @@ class AgentFlow:
             output = None
             stop = False
             step_error = None
+            handler_variables = {}
             max_retries = getattr(step, 'max_retries', 3)
             retry_count = 0
             validation_feedback = None
@@ -1688,6 +1710,7 @@ class AgentFlow:
                             output = result.output
                             stop = result.stop_workflow
                             if result.variables:
+                                handler_variables = dict(result.variables)
                                 all_variables.update(result.variables)
                         else:
                             output = str(result)
@@ -1984,17 +2007,27 @@ class AgentFlow:
 
             # Only a SUCCESSFUL step is cached. Caching a failure would serve
             # the failure again on every re-run, turning a transient error into
-            # a permanent one that no retry could clear. The step's output
-            # variable is stored too: a fresh run starts with empty working
-            # variables, so a cache HIT that only restored `output` would leave
-            # `<step>_output` (or step.output_variable) missing and break the
-            # next step's substitutions. We snapshot exactly the delta this step
-            # writes below (var_name = output_variable or f"{name}_output").
+            # a permanent one that no retry could clear. We snapshot the full
+            # delta this step writes so a HIT replays it exactly: the stop
+            # signal, any handler-supplied variables, the step record's status
+            # and retries, and -- unless the step stopped before writing it --
+            # the `<step>_output` (or step.output_variable) entry. A fresh run
+            # starts with empty working variables, so a hit that restored only
+            # `output` would leave those missing and break the next step.
             if _cache_key is not None and not step_failed:
-                _cached_var_name = step.output_variable or f"{step.name}_output"
+                _cached_variables = dict(handler_variables)
+                if not stop:
+                    _cached_var_name = step.output_variable or f"{step.name}_output"
+                    _cached_variables[_cached_var_name] = output
                 _step_cache.set(
                     _cache_key,
-                    {"output": output, "variables": {_cached_var_name: output}},
+                    {
+                        "output": output,
+                        "variables": _cached_variables,
+                        "stop_workflow": stop,
+                        "status": step_record["status"],
+                        "retries": retry_count,
+                    },
                 )
             
             if verbose:
