@@ -54,6 +54,26 @@ MIN_BRANCHES_FOR_LLM_SUMMARY = 3
 _RUN_LOCK_INIT_GUARD = threading.Lock()
 
 
+def _snapshot_value(value: Any) -> Any:
+    """Return an isolated copy of ``value`` for the step cache.
+
+    A cache hit must behave like re-running the step, so cached variables are
+    copied both when stored and when replayed to prevent a downstream step
+    mutating a shared object and silently corrupting what later hits see. Values
+    that cannot be deep-copied (locks, open handles, etc.) fall back to the live
+    reference - the pre-existing behaviour - rather than failing the workflow.
+    """
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def _snapshot_variables(variables: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-copy each value in a variables mapping (see ``_snapshot_value``)."""
+    return {key: _snapshot_value(val) for key, val in variables.items()}
+
+
 class _WriteTrackingDict(dict):
     """A ``dict`` that records which keys were assigned after construction.
 
@@ -1648,7 +1668,12 @@ class AgentFlow:
                     if hasattr(step, 'status'):
                         step.status = step_record["status"]
                     if _cached.get("variables"):
-                        all_variables.update(_cached["variables"])
+                        # Deep-copy on the way out too so the live run gets an
+                        # isolated copy; mutating it must not leak back into the
+                        # cache and change what later hits replay.
+                        all_variables.update(
+                            _snapshot_variables(_cached["variables"])
+                        )
                     if _cached.get("stop_workflow"):
                         if verbose:
                             print(f"🛑 Workflow stopped at: {step.name}")
@@ -1710,7 +1735,12 @@ class AgentFlow:
                             output = result.output
                             stop = result.stop_workflow
                             if result.variables:
-                                handler_variables = dict(result.variables)
+                                # Accumulate across retries so the cached
+                                # snapshot matches the cold run: a rejected
+                                # attempt that wrote {a, b} followed by an
+                                # accepted attempt that wrote {a} leaves both
+                                # keys in the live run, so both must be cached.
+                                handler_variables.update(result.variables)
                                 all_variables.update(result.variables)
                         else:
                             output = str(result)
@@ -2015,10 +2045,14 @@ class AgentFlow:
             # starts with empty working variables, so a hit that restored only
             # `output` would leave those missing and break the next step.
             if _cache_key is not None and not step_failed:
-                _cached_variables = dict(handler_variables)
+                # Deep-copy handler variables so a downstream step mutating a
+                # replayed object cannot corrupt the cached snapshot (and vice
+                # versa). Fall back to the live reference only for values that
+                # cannot be deep-copied.
+                _cached_variables = _snapshot_variables(handler_variables)
                 if not stop:
                     _cached_var_name = step.output_variable or f"{step.name}_output"
-                    _cached_variables[_cached_var_name] = output
+                    _cached_variables[_cached_var_name] = _snapshot_value(output)
                 _step_cache.set(
                     _cache_key,
                     {
