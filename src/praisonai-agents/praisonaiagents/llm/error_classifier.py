@@ -690,11 +690,15 @@ def extract_retry_after(
     error_str = str(error)
     
     # 3. Fall back to parsing common Retry-After patterns from the message.
+    #    The optional leading sign is captured so an echoed negative hint (e.g.
+    #    "retry after -3600 seconds") is seen as negative and rejected by
+    #    ``_usable_retry_delay`` rather than silently read as a positive delay
+    #    that would park a scheduler hold on an invalid reset window.
     patterns = [
-        r"retry.?after[:\s]+(\d+)",
-        r"retry[:\s]+(\d+)",
-        r"wait[:\s]+(\d+)",
-        r"(\d+).*second",
+        r"retry.?after[:\s]+(-?\d+)",
+        r"retry[:\s]+(-?\d+)",
+        r"wait[:\s]+(-?\d+)",
+        r"(-?\d+)\s*(?:\.\d+)?\s*second",
     ]
     
     for pattern in patterns:
@@ -702,9 +706,11 @@ def extract_retry_after(
         if match:
             try:
                 delay = float(match.group(1))
-                return min(delay, cap_seconds)
             except (ValueError, IndexError):
                 continue
+            usable = _usable_retry_delay(delay, cap_seconds)
+            if usable is not None:
+                return usable
     
     return None
 
