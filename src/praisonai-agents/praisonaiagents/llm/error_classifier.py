@@ -693,17 +693,21 @@ def extract_retry_after(
     #    The optional leading sign is captured so an echoed negative hint (e.g.
     #    "retry after -3600 seconds") is seen as negative and rejected by
     #    ``_usable_retry_delay`` rather than silently read as a positive delay
-    #    that would park a scheduler hold on an invalid reset window.
+    #    that would park a scheduler hold on an invalid reset window. The number
+    #    need not be adjacent to "second" so phrasings like "retry in 30 more
+    #    seconds" still yield their reset window.
     patterns = [
-        r"retry.?after[:\s]+(-?\d+)",
-        r"retry[:\s]+(-?\d+)",
-        r"wait[:\s]+(-?\d+)",
-        r"(-?\d+)\s*(?:\.\d+)?\s*second",
+        r"retry.?after[:\s]+(-?\d+(?:\.\d+)?)",
+        r"retry[:\s]+(-?\d+(?:\.\d+)?)",
+        r"wait[:\s]+(-?\d+(?:\.\d+)?)",
+        r"(-?\d+(?:\.\d+)?)\s*(?:\w+\s+)*?second",
     ]
-    
+
     for pattern in patterns:
-        match = re.search(pattern, error_str, re.IGNORECASE)
-        if match:
+        # Scan every match, not just the first: an earlier invalid hint (e.g. a
+        # negative value) must not shadow a later valid one in the same message
+        # (e.g. "retry after -5 seconds; retry after 30 seconds").
+        for match in re.finditer(pattern, error_str, re.IGNORECASE):
             try:
                 delay = float(match.group(1))
             except (ValueError, IndexError):
@@ -711,7 +715,7 @@ def extract_retry_after(
             usable = _usable_retry_delay(delay, cap_seconds)
             if usable is not None:
                 return usable
-    
+
     return None
 
 
